@@ -1,5 +1,11 @@
 # `zincio-http` change log
 
+## `zincio-http` 0.4.13
+
+**Released in October 16, 2026**
+
+- Improved response handling for HTTP `HEAD` requests (content length + HTTP/1.x transfer encoding)
+
 ## `zincio-http` 0.4.12
 
 **Released in October 16, 2026**

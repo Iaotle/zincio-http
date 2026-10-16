@@ -36,44 +36,44 @@ where
             );
         }
 
-        let (parts, body, chunked) = if !is_head {
-            // If the body has a size hint, set the Content-Length header if it's not already set
-            if let Some(suggested_content_length) = response.body().size_hint().exact() {
-                let headers = response.headers_mut();
-                if !headers.contains_key(header::CONTENT_LENGTH) {
-                    headers.insert(header::CONTENT_LENGTH, suggested_content_length.into());
-                }
+        // If the body has a size hint, set the Content-Length header if it's not already set
+        if let Some(suggested_content_length) = response.body().size_hint().exact() {
+            let headers = response.headers_mut();
+            if !headers.contains_key(header::CONTENT_LENGTH) {
+                headers.insert(header::CONTENT_LENGTH, suggested_content_length.into());
             }
+        }
 
-            let chunked = response
-                .headers()
-                .get(header::TRANSFER_ENCODING)
-                .map(|v| {
-                    v.to_str().ok().is_some_and(|s| {
-                        s.split(',')
-                            .any(|s| s.trim().eq_ignore_ascii_case("chunked"))
-                    })
+        let chunked = response
+            .headers()
+            .get(header::TRANSFER_ENCODING)
+            .map(|v| {
+                v.to_str().ok().is_some_and(|s| {
+                    s.split(',')
+                        .any(|s| s.trim().eq_ignore_ascii_case("chunked"))
                 })
-                .unwrap_or_else(|| {
-                    response
-                        .headers()
-                        .get(header::CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .is_none_or(|s| s.parse::<u64>().is_err())
-                });
+            })
+            .unwrap_or_else(|| {
+                response
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .is_none_or(|s| s.parse::<u64>().is_err())
+            });
 
-            if chunked {
-                response.headers_mut().insert(
-                    header::TRANSFER_ENCODING,
-                    HeaderValue::from_static("chunked"),
-                );
-                while response
-                    .headers_mut()
-                    .remove(header::CONTENT_LENGTH)
-                    .is_some()
-                {}
-            }
+        if chunked {
+            response.headers_mut().insert(
+                header::TRANSFER_ENCODING,
+                HeaderValue::from_static("chunked"),
+            );
+            while response
+                .headers_mut()
+                .remove(header::CONTENT_LENGTH)
+                .is_some()
+            {}
+        }
 
+        let (parts, body, chunked) = if !is_head {
             let (parts, body) = response.into_parts();
             (parts, Some(body), chunked)
         } else {

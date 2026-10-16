@@ -566,7 +566,7 @@ async fn handle_request<F, Fut, ResB, ResBE, ResE>(
         remove_invalid_http3_headers(response_headers);
     }
 
-    let response_is_end_stream = response.body().is_end_stream() || is_head;
+    let response_is_end_stream = response.body().is_end_stream();
     if !response_is_end_stream {
         if let Some(content_length) = response.body().size_hint().exact() {
             if !response
@@ -578,13 +578,6 @@ async fn handle_request<F, Fut, ResB, ResBE, ResE>(
                     .insert(http::header::CONTENT_LENGTH, content_length.into());
             }
         }
-    } else if is_head {
-        // Remove Content-Length interference
-        while response
-            .headers_mut()
-            .remove(http::header::CONTENT_LENGTH)
-            .is_some()
-        {}
     }
 
     if is_100_continue
@@ -621,7 +614,7 @@ async fn handle_request<F, Fut, ResB, ResBE, ResE>(
         }
     }
 
-    if !response_is_end_stream {
+    if !response_is_end_stream && !is_head {
         while let Some(chunk) = response_body.frame().await {
             match chunk {
                 Ok(frame) => {

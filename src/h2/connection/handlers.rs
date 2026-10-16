@@ -314,6 +314,18 @@ where
         let response_fut = Box::pin(async move {
             let mut response = request_fn(request).await.map_err(e2io)?;
             sanitize_response(&mut response, send_date_header, &date_cache);
+            if !response.body().is_end_stream() {
+                if let Some(content_length) = response.body().size_hint().exact() {
+                    if !response
+                        .headers()
+                        .contains_key(http::header::CONTENT_LENGTH)
+                    {
+                        response
+                            .headers_mut()
+                            .insert(http::header::CONTENT_LENGTH, content_length.into());
+                    }
+                }
+            }
             Ok::<Response<ConnBody>, std::io::Error>(response.map(ConnBody::new))
         });
 
