@@ -12,6 +12,7 @@ Several bugs in `zincio-http`'s changelog were found by running a real-world HTT
 | 0.4.2 | `curl: (18) stream 0 reset` on HTTP/3 | curl |
 | 0.4.8 | flow-control reset on large response bodies | hyper |
 | 0.4.11 | 100 Continue response-related deadlocks | OkHttp |
+| 0.4.12 | HTTP response body unnecessarily send for `HEAD` requests | curl |
 
 ## Design notes
 
