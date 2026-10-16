@@ -1,5 +1,11 @@
 # `zincio-http` change log
 
+## `zincio-http` UNRELEASED
+
+**Not yet released**
+
+- When a response for an HTTP `HEAD` request, the response body is now discarded instead of being sent to the client, improving HTTP spec compliance (the previous behavior would error out when using with curl clients).
+
 ## `zincio-http` 0.4.11
 
 **Released in October 6, 2026**

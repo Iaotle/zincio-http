@@ -279,6 +279,7 @@ where
         let body_rx = entry.body_rx.take();
         let reset_rx = entry.reset_rx.take().expect("reset receiver");
 
+        let is_head = parsed.method == http::Method::HEAD;
         let send_continue = self.opts.send_continue_response && parsed.expect_continue;
         let send_continue_body = send_continue.then(|| Arc::new(AtomicBool::new(false)));
         let (early_hints, early_hints_rx) = EarlyHints::new_lazy();
@@ -325,6 +326,7 @@ where
             send_continue,
             send_continue_body,
             parsed.is_connect,
+            is_head,
         ));
     }
 

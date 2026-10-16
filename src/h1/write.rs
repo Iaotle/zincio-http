@@ -20,6 +20,7 @@ where
         >,
         version: Version,
         write_trailers: bool,
+        is_head: bool,
         zerocopy_fn: Option<Z>,
     ) -> Result<(), std::io::Error>
     where
@@ -35,44 +36,57 @@ where
             );
         }
 
-        // If the body has a size hint, set the Content-Length header if it's not already set
-        if let Some(suggested_content_length) = response.body().size_hint().exact() {
-            let headers = response.headers_mut();
-            if !headers.contains_key(header::CONTENT_LENGTH) {
-                headers.insert(header::CONTENT_LENGTH, suggested_content_length.into());
+        let (parts, body, chunked) = if !is_head {
+            // If the body has a size hint, set the Content-Length header if it's not already set
+            if let Some(suggested_content_length) = response.body().size_hint().exact() {
+                let headers = response.headers_mut();
+                if !headers.contains_key(header::CONTENT_LENGTH) {
+                    headers.insert(header::CONTENT_LENGTH, suggested_content_length.into());
+                }
             }
-        }
 
-        let chunked = response
-            .headers()
-            .get(header::TRANSFER_ENCODING)
-            .map(|v| {
-                v.to_str().ok().is_some_and(|s| {
-                    s.split(',')
-                        .any(|s| s.trim().eq_ignore_ascii_case("chunked"))
+            let chunked = response
+                .headers()
+                .get(header::TRANSFER_ENCODING)
+                .map(|v| {
+                    v.to_str().ok().is_some_and(|s| {
+                        s.split(',')
+                            .any(|s| s.trim().eq_ignore_ascii_case("chunked"))
+                    })
                 })
-            })
-            .unwrap_or_else(|| {
-                response
-                    .headers()
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .is_none_or(|s| s.parse::<u64>().is_err())
-            });
+                .unwrap_or_else(|| {
+                    response
+                        .headers()
+                        .get(header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .is_none_or(|s| s.parse::<u64>().is_err())
+                });
 
-        if chunked {
-            response.headers_mut().insert(
-                header::TRANSFER_ENCODING,
-                HeaderValue::from_static("chunked"),
-            );
+            if chunked {
+                response.headers_mut().insert(
+                    header::TRANSFER_ENCODING,
+                    HeaderValue::from_static("chunked"),
+                );
+                while response
+                    .headers_mut()
+                    .remove(header::CONTENT_LENGTH)
+                    .is_some()
+                {}
+            }
+
+            let (parts, body) = response.into_parts();
+            (parts, Some(body), chunked)
+        } else {
+            // Remove Content-Length interference
             while response
                 .headers_mut()
                 .remove(header::CONTENT_LENGTH)
                 .is_some()
             {}
-        }
 
-        let (parts, mut body) = response.into_parts();
+            let (parts, _) = response.into_parts();
+            (parts, None, false)
+        };
 
         self.response_head_buf.clear();
         let estimated_head_len = 30 + parts.headers.len() * 30; // Similar to Hyper's heuristic
@@ -135,77 +149,79 @@ where
             }
         }
 
-        let mut trailers_written = false;
-        let mut first_chunk = true;
-        while let Some(chunk) = futures_util::select_biased! {
-            // Biased, to not flush the buffer before attempting to read the next chunk
+        if let Some(mut body) = body {
+            let mut trailers_written = false;
+            let mut first_chunk = true;
+            while let Some(chunk) = futures_util::select_biased! {
+                // Biased, to not flush the buffer before attempting to read the next chunk
 
-            chunk = body.frame().fuse() => chunk,
-            _ = (async {
-                if !first_chunk {
-                    let _ = unsafe {
-                        self.write_buf
-                            .flush(&mut self.io, self.options.enable_vectored_write)
-                            .await
-                    };
-                    let _ = self.io.flush().await;
-                }
-                std::future::pending::<()>().await
-            }).fuse() => unreachable!()
-        } {
-            first_chunk = false;
-            let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
-            match chunk.into_data() {
-                Ok(data) => {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if chunked {
-                        let mut chunk_size_buf = [0u8; 18];
-                        let chunk_size = write_chunk_size(&mut chunk_size_buf, data.len());
-                        self.write_buf.push_copy(chunk_size);
-                        self.write_buf.push_bytes(data);
-                        unsafe {
-                            self.write_buf.push(IoSlice::new(b"\r\n"));
-                        }
-                    } else {
-                        self.write_buf.push_bytes(data);
-                    }
-                    while self.write_buf.len() >= WRITE_BUF_BATCH_THRESHOLD {
-                        let bytes_written = unsafe {
+                chunk = body.frame().fuse() => chunk,
+                _ = (async {
+                    if !first_chunk {
+                        let _ = unsafe {
                             self.write_buf
-                                .write(&mut self.io, self.options.enable_vectored_write)
-                                .await?
+                                .flush(&mut self.io, self.options.enable_vectored_write)
+                                .await
                         };
-                        if bytes_written == 0 {
-                            return Err(std::io::ErrorKind::WriteZero.into());
-                        }
+                        let _ = self.io.flush().await;
                     }
-                }
-                Err(chunk) => {
-                    if let Ok(trailers) = chunk.into_trailers() {
-                        if write_trailers {
+                    std::future::pending::<()>().await
+                }).fuse() => unreachable!()
+            } {
+                first_chunk = false;
+                let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
+                match chunk.into_data() {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if chunked {
+                            let mut chunk_size_buf = [0u8; 18];
+                            let chunk_size = write_chunk_size(&mut chunk_size_buf, data.len());
+                            self.write_buf.push_copy(chunk_size);
+                            self.write_buf.push_bytes(data);
                             unsafe {
-                                self.write_buf.push(IoSlice::new(b"0\r\n"));
-                                for (name, value) in &trailers {
-                                    self.write_buf.push_copy(name.as_str().as_bytes());
-                                    self.write_buf.push(IoSlice::new(b": "));
-                                    self.write_buf.push_copy(value.as_bytes());
-                                    self.write_buf.push(IoSlice::new(b"\r\n"));
-                                }
                                 self.write_buf.push(IoSlice::new(b"\r\n"));
                             }
-                            trailers_written = true;
+                        } else {
+                            self.write_buf.push_bytes(data);
                         }
-                        break;
+                        while self.write_buf.len() >= WRITE_BUF_BATCH_THRESHOLD {
+                            let bytes_written = unsafe {
+                                self.write_buf
+                                    .write(&mut self.io, self.options.enable_vectored_write)
+                                    .await?
+                            };
+                            if bytes_written == 0 {
+                                return Err(std::io::ErrorKind::WriteZero.into());
+                            }
+                        }
                     }
+                    Err(chunk) => {
+                        if let Ok(trailers) = chunk.into_trailers() {
+                            if write_trailers {
+                                unsafe {
+                                    self.write_buf.push(IoSlice::new(b"0\r\n"));
+                                    for (name, value) in &trailers {
+                                        self.write_buf.push_copy(name.as_str().as_bytes());
+                                        self.write_buf.push(IoSlice::new(b": "));
+                                        self.write_buf.push_copy(value.as_bytes());
+                                        self.write_buf.push(IoSlice::new(b"\r\n"));
+                                    }
+                                    self.write_buf.push(IoSlice::new(b"\r\n"));
+                                }
+                                trailers_written = true;
+                            }
+                            break;
+                        }
+                    }
+                };
+            }
+            if chunked && !trailers_written {
+                // Terminating chunk
+                unsafe {
+                    self.write_buf.push(IoSlice::new(b"0\r\n\r\n"));
                 }
-            };
-        }
-        if chunked && !trailers_written {
-            // Terminating chunk
-            unsafe {
-                self.write_buf.push(IoSlice::new(b"0\r\n\r\n"));
             }
         }
         unsafe {

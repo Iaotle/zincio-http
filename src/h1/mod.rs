@@ -316,74 +316,85 @@ where
         let mut keep_alive = true;
 
         while keep_alive {
-            let (mut request, body_tx, send_continue_body) = match if let Some(timeout) =
-                self.options.header_read_timeout
-            {
-                zincio::time::timeout(timeout, async {
-                    if let Some(token) = self.cancel_token.clone() {
-                        token.run_until_cancelled(self.read_request()).await
-                    } else {
-                        Some(self.read_request().await)
+            let (mut request, body_tx, send_continue_body) =
+                match if let Some(timeout) = self.options.header_read_timeout {
+                    zincio::time::timeout(timeout, async {
+                        if let Some(token) = self.cancel_token.clone() {
+                            token.run_until_cancelled(self.read_request()).await
+                        } else {
+                            Some(self.read_request().await)
+                        }
+                    })
+                    .await
+                } else {
+                    Ok(Some(self.read_request().await))
+                } {
+                    Ok(Some(Ok(Some(d)))) => d,
+                    Ok(Some(Ok(None))) => {
+                        return Ok(());
                     }
-                })
-                .await
-            } else {
-                Ok(Some(self.read_request().await))
-            } {
-                Ok(Some(Ok(Some(d)))) => d,
-                Ok(Some(Ok(None))) => {
-                    return Ok(());
-                }
-                Ok(Some(Err(e)))
-                    if self.connection_idle
-                        && matches!(
-                            e.kind(),
-                            std::io::ErrorKind::BrokenPipe
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::UnexpectedEof
-                        ) =>
-                {
-                    // HTTP/1.x abruptly closed when idle
-                    return Ok(());
-                }
-                Ok(Some(Err(e))) => {
-                    if let Ok(mut response) = error_fn(false).await {
-                        response
-                            .headers_mut()
-                            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                    Ok(Some(Err(e)))
+                        if self.connection_idle
+                            && matches!(
+                                e.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) =>
+                    {
+                        // HTTP/1.x abruptly closed when idle
+                        return Ok(());
+                    }
+                    Ok(Some(Err(e))) => {
+                        if let Ok(mut response) = error_fn(false).await {
+                            response
+                                .headers_mut()
+                                .insert(header::CONNECTION, HeaderValue::from_static("close"));
 
-                        let _ = self
-                            .write_response(response, Version::HTTP_11, false, zerocopy_fn.as_mut())
-                            .await;
+                            let _ = self
+                                .write_response(
+                                    response,
+                                    Version::HTTP_11,
+                                    false,
+                                    false,
+                                    zerocopy_fn.as_mut(),
+                                )
+                                .await;
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-                Ok(None) => {
-                    // Graceful shutdown
-                    return Ok(());
-                }
-                Err(_) if self.connection_idle => {
-                    // Idle connection
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Timeout error
-                    if let Ok(mut response) = error_fn(true).await {
-                        response
-                            .headers_mut()
-                            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                    Ok(None) => {
+                        // Graceful shutdown
+                        return Ok(());
+                    }
+                    Err(_) if self.connection_idle => {
+                        // Idle connection
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // Timeout error
+                        if let Ok(mut response) = error_fn(true).await {
+                            response
+                                .headers_mut()
+                                .insert(header::CONNECTION, HeaderValue::from_static("close"));
 
-                        let _ = self
-                            .write_response(response, Version::HTTP_11, false, zerocopy_fn.as_mut())
-                            .await;
+                            let _ = self
+                                .write_response(
+                                    response,
+                                    Version::HTTP_11,
+                                    false,
+                                    false,
+                                    zerocopy_fn.as_mut(),
+                                )
+                                .await;
+                        }
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "header read timeout",
+                        ));
                     }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "header read timeout",
-                    ));
-                }
-            };
+                };
 
             // Connection header detection
             let connection_header_split = request
@@ -400,6 +411,7 @@ where
                 && (is_connection_keep_alive || request.version() == http::Version::HTTP_11);
 
             let version = request.version();
+            let is_head = request.method() == http::Method::HEAD; // Used to inhibit body sending (to keep HTTP protocol compliance)
             let is_100_continue = send_continue_body.is_some();
 
             // 103 Early Hints
@@ -555,8 +567,14 @@ where
                     .insert(header::CONNECTION, HeaderValue::from_static("close"));
             }
 
-            self.write_response(response, version, write_trailers, zerocopy_fn.as_mut())
-                .await?;
+            self.write_response(
+                response,
+                version,
+                write_trailers,
+                is_head,
+                zerocopy_fn.as_mut(),
+            )
+            .await?;
 
             if was_upgraded {
                 // HTTP upgrade

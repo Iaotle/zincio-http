@@ -52,6 +52,7 @@ pin_project! {
             continue_sent: bool,
             early_hints_open: bool,
             extended_connect: bool,
+            is_head: bool,
         },
         Body {
             headers: Option<http::response::Parts>,
@@ -75,6 +76,7 @@ impl<Fut, ResB> StreamDriver<Fut, ResB> {
         send_continue: bool,
         send_continue_body: Option<Arc<AtomicBool>>,
         extended_connect: bool,
+        is_head: bool,
     ) -> Self {
         Self {
             msg_tx,
@@ -95,6 +97,7 @@ impl<Fut, ResB> StreamDriver<Fut, ResB> {
                 continue_sent: false,
                 early_hints_open: true,
                 extended_connect,
+                is_head,
             },
         }
     }
@@ -162,6 +165,7 @@ where
                     continue_sent,
                     early_hints_open,
                     extended_connect,
+                    is_head,
                 } => {
                     match Self::poll_service(
                         this.msg_tx,
@@ -178,6 +182,7 @@ where
                         continue_sent,
                         early_hints_open,
                         *extended_connect,
+                        *is_head,
                         cx,
                     ) {
                         ServicePoll::Done => {}
@@ -252,6 +257,7 @@ where
         continue_sent: &mut bool,
         early_hints_open: &mut bool,
         extended_connect: bool,
+        is_head: bool,
         cx: &mut Context<'_>,
     ) -> ServicePoll<ResB> {
         loop {
@@ -287,8 +293,14 @@ where
                     }
                     *continue_sent = true;
                 }
-                let response_is_end_stream = response.body().is_end_stream();
-                let (parts, response_body) = response.into_parts();
+                let (response_is_end_stream, parts, response_body) = if !is_head {
+                    let response_is_end_stream = response.body().is_end_stream();
+                    let (parts, response_body) = response.into_parts();
+                    (response_is_end_stream, parts, Some(response_body))
+                } else {
+                    let (parts, _) = response.into_parts();
+                    (true, parts, None)
+                };
 
                 if response_is_end_stream || extended_connect {
                     match Self::send(
@@ -307,7 +319,7 @@ where
                 } else {
                     *headers = Some(parts);
                 }
-                *body = Some(response_body);
+                *body = response_body;
                 *response_done = true;
                 continue;
             }
