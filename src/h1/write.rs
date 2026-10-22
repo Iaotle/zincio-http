@@ -77,13 +77,6 @@ where
             let (parts, body) = response.into_parts();
             (parts, Some(body), chunked)
         } else {
-            // Remove Content-Length interference
-            while response
-                .headers_mut()
-                .remove(header::CONTENT_LENGTH)
-                .is_some()
-            {}
-
             let (parts, _) = response.into_parts();
             (parts, None, false)
         };
