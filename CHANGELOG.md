@@ -1,8 +1,8 @@
 # `zincio-http` change log
 
-## `zincio-http` UNRELEASED
+## `zincio-http` 0.4.14
 
-**Not yet released**
+**Released in October 22, 2026**
 
 - Further improved response handling for HTTP `HEAD` requests (content length + HTTP/1.x transfer encoding)
 - Hardened the HTTP/3 implementation against potential QPACK deocding vulnerabilities
