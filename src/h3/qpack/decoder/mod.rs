@@ -73,6 +73,27 @@ const LITERAL_POST_BASE_NAME_REF: u8 = 0b0000_0000;
 /// (4.5.6).
 const LITERAL_LITERAL_NAME: u8 = 0b0010_0000;
 
+/// The per-field overhead a field list's size includes (RFC 9114 Section
+/// 4.2.2): "the size of a field list is calculated based on the uncompressed
+/// size of fields, including the length of the name and value in bytes plus
+/// an overhead of 32 bytes for each field".
+///
+/// Charging it per field is what keeps a field section's cost proportional
+/// to the number of fields it carries: without it, a field line with an
+/// empty name and an empty value would cost nothing, and a section could
+/// hold millions of fields while staying "within" the advertised limit.
+pub const FIELD_OVERHEAD: usize = 32;
+
+/// The maximum number of fields a single field section may carry.
+///
+/// The field-section size limit already bounds the number of fields (each
+/// one costs at least [`FIELD_OVERHEAD`] bytes of it), but that limit can
+/// be disabled. This cap does not depend on it: it keeps one section's
+/// decoded fields within a few hundred kilobytes, and it stays below the
+/// 24 576 entries an `http::HeaderMap` holds, so a section that fits the
+/// cap can always be inserted into one.
+pub const MAX_FIELDS_PER_SECTION: usize = 8192;
+
 /// A field section that was buffered as blocked and has since been decoded
 /// after an encoder stream update.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,9 +153,12 @@ pub struct Decoder {
     /// SETTINGS_QPACK_BLOCKED_STREAMS (RFC 9204 Section 5).
     max_blocked_streams: usize,
     /// Cap on the total size of a decoded field section (the sum of the
-    /// lengths of the names and values of its field lines), the locally
-    /// advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 Section
-    /// 7.2.4.1). Exceeding it is `QPACK_DECOMPRESSION_FAILED`.
+    /// lengths of the names and values of its field lines, plus the
+    /// per-field overhead of [`FIELD_OVERHEAD`]), the locally advertised
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 Section 7.2.4.1).
+    /// Exceeding it is `QPACK_DECOMPRESSION_FAILED`.
+    ///
+    /// `usize::MAX` means the limit is disabled.
     max_field_section_size: usize,
     /// Decoder stream instructions awaiting transmission.
     decoder_stream: Vec<u8>,
@@ -236,8 +260,11 @@ impl Decoder {
     /// advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 Section
     /// 7.2.4.1). The budget is per stream and accumulates across its field
     /// sections (request headers and trailers); a section that pushes a
-    /// stream's cumulative name and value octets over this is rejected
-    /// with `QPACK_DECOMPRESSION_FAILED` (RFC 9204 Section 4.5).
+    /// stream's cumulative size over this is rejected with
+    /// `QPACK_DECOMPRESSION_FAILED` (RFC 9204 Section 4.5).
+    ///
+    /// The size of a field list is the sum of its fields' name and value
+    /// lengths plus [`FIELD_OVERHEAD`] per field (RFC 9114 Section 4.2.2).
     #[inline]
     pub fn set_max_field_section_size(&mut self, size: usize) {
         self.max_field_section_size = size;
@@ -369,11 +396,9 @@ impl Decoder {
             }
             let front = self.blocked.pop_front().expect("front just inspected");
             self.remove_blocked_section(front.stream_id);
-            let headers = self.decode_ready(&front.buf)?;
-            let size: usize = headers.iter().map(|(n, v)| n.len() + v.len()).sum();
-            if self.account_section(front.stream_id, size) > self.max_field_section_size {
-                return Err(QpackError::DecompressionFailed);
-            }
+            let budget = self.remaining_budget(front.stream_id);
+            let (headers, size) = self.decode_ready(&front.buf, budget)?;
+            self.account_section(front.stream_id, size);
             if front.ric > 0 {
                 self.acknowledge(front.ric);
                 self.emit_section_ack(front.stream_id);
@@ -505,11 +530,9 @@ impl Decoder {
             self.add_blocked_section(stream_id);
             return Ok(None);
         }
-        let headers = self.decode_ready(buf)?;
-        let size: usize = headers.iter().map(|(n, v)| n.len() + v.len()).sum();
-        if self.account_section(stream_id, size) > self.max_field_section_size {
-            return Err(QpackError::DecompressionFailed);
-        }
+        let budget = self.remaining_budget(stream_id);
+        let (headers, size) = self.decode_ready(buf, budget)?;
+        self.account_section(stream_id, size);
         if ric > 0 {
             self.acknowledge(ric);
             self.emit_section_ack(stream_id);
@@ -581,15 +604,28 @@ impl Decoder {
     /// (immediate or retried from the blocked queue), validating that the
     /// announced Required Insert Count equals the largest referenced
     /// absolute index plus one (RFC 9204 Section 2.1.2).
+    ///
+    /// `budget` is the decoded size still available to the stream this
+    /// section belongs to; the section is rejected as soon as it exceeds
+    /// it, so a hostile section never materializes more than the budget
+    /// allows. `None` means the limit is disabled; the number of fields is
+    /// then still capped by [`MAX_FIELDS_PER_SECTION`].
+    ///
+    /// Returns the decoded field lines and the size they occupy.
     #[inline]
-    fn decode_ready(&self, buf: &[u8]) -> Result<Vec<(Bytes, Bytes)>, QpackError> {
+    fn decode_ready(
+        &self,
+        buf: &[u8],
+        budget: Option<usize>,
+    ) -> Result<(Vec<(Bytes, Bytes)>, usize), QpackError> {
         let (ric, base, mut off) = self.read_prefix(buf)?;
         let mut headers = Vec::new();
         let mut needed = 0u64;
+        let mut size = 0usize;
         while off < buf.len() {
             let header = buf[off];
             off += 1;
-            if header & 0x80 != 0 {
+            let (name, value) = if header & 0x80 != 0 {
                 // Indexed Field Line (4.5.2).
                 let index = integer::decode(buf, &mut off, 6, header).map_err(dec_failed)?;
                 if header & 0x40 != 0 {
@@ -598,7 +634,7 @@ impl Decoder {
                         usize::try_from(index).map_err(|_| QpackError::DecompressionFailed)?;
                     let (name, value) =
                         static_table::get(idx).ok_or(QpackError::DecompressionFailed)?;
-                    headers.push((Bytes::from_static(name), Bytes::from_static(value)));
+                    (Bytes::from_static(name), Bytes::from_static(value))
                 } else {
                     // Dynamic table (T=0): relative index from the Base.
                     let (name, value) = self
@@ -606,7 +642,7 @@ impl Decoder {
                         .get_base_relative_bytes(base, index)
                         .ok_or(QpackError::DecompressionFailed)?;
                     needed = needed.max(base - index);
-                    headers.push((name, value));
+                    (name, value)
                 }
             } else if header & 0x40 != 0 {
                 // Literal Field Line with Name Reference (4.5.4).
@@ -618,7 +654,7 @@ impl Decoder {
                         usize::try_from(index).map_err(|_| QpackError::DecompressionFailed)?;
                     let (name, _) =
                         static_table::get(idx).ok_or(QpackError::DecompressionFailed)?;
-                    headers.push((Bytes::from_static(name), value));
+                    (Bytes::from_static(name), value)
                 } else {
                     // Dynamic table (T=0): relative index from the Base.
                     let (name, _) = self
@@ -626,7 +662,7 @@ impl Decoder {
                         .get_base_relative_bytes(base, index)
                         .ok_or(QpackError::DecompressionFailed)?;
                     needed = needed.max(base - index);
-                    headers.push((name, value));
+                    (name, value)
                 }
             } else if header & 0x20 != 0 {
                 // Literal Field Line with Literal Name (4.5.6): the N bit is
@@ -636,7 +672,7 @@ impl Decoder {
                     .read_string(buf, &mut off, 4, header)
                     .map_err(dec_failed)?;
                 let value = self.read_value_string(buf, &mut off).map_err(dec_failed)?;
-                headers.push((name, value));
+                (name, value)
             } else if header & 0x10 != 0 {
                 // Indexed Field Line with Post-Base Index (4.5.3).
                 let index = integer::decode(buf, &mut off, 4, header).map_err(dec_failed)?;
@@ -645,7 +681,7 @@ impl Decoder {
                     .get_post_base_bytes(base, index)
                     .ok_or(QpackError::DecompressionFailed)?;
                 needed = needed.max(base + index + 1);
-                headers.push((name, value));
+                (name, value)
             } else {
                 // Literal Field Line with Post-Base Name Reference (4.5.5).
                 let index = integer::decode(buf, &mut off, 3, header).map_err(dec_failed)?;
@@ -655,13 +691,25 @@ impl Decoder {
                     .ok_or(QpackError::DecompressionFailed)?;
                 needed = needed.max(base + index + 1);
                 let value = self.read_value_string(buf, &mut off).map_err(dec_failed)?;
-                headers.push((name, value));
+                (name, value)
+            };
+            // Account the field before retaining it: the budget bounds the
+            // memory a single field section can cost, so a section that does
+            // not fit is rejected while it is decoded rather than after it
+            // has been materialized (RFC 9114 Section 4.2.2).
+            size = size.saturating_add(name.len() + value.len() + FIELD_OVERHEAD);
+            if budget.is_some_and(|limit| size > limit) {
+                return Err(QpackError::DecompressionFailed);
             }
+            if headers.len() >= MAX_FIELDS_PER_SECTION {
+                return Err(QpackError::DecompressionFailed);
+            }
+            headers.push((name, value));
         }
         if ric != needed {
             return Err(QpackError::DecompressionFailed);
         }
-        Ok(headers)
+        Ok((headers, size))
     }
 
     /// Parses the Encoded Field Section Prefix (RFC 9204 Section 4.5.1):
@@ -794,7 +842,8 @@ impl Decoder {
     /// returns the stream's new cumulative total. Creates the entry on
     /// first use.
     ///
-    /// `size` is the decoded name and value octets, not the size of the
+    /// `size` is the decoded size of the field lines — the name and value
+    /// octets plus [`FIELD_OVERHEAD`] per field — not the size of the
     /// encoded block: Huffman encoding and index references make the two
     /// diverge arbitrarily (RFC 9114 Section 7.2.4.1).
     #[inline]
@@ -802,6 +851,24 @@ impl Decoder {
         let total = self.section_size_by_stream.entry(stream_id).or_insert(0);
         *total = total.saturating_add(size);
         *total
+    }
+
+    /// The decoded size still available to `stream_id`, or `None` when the
+    /// limit is disabled.
+    ///
+    /// A section that exceeds it is rejected while it is decoded, so the
+    /// budget bounds the memory one field section can cost.
+    #[inline]
+    fn remaining_budget(&self, stream_id: u64) -> Option<usize> {
+        if self.max_field_section_size == usize::MAX {
+            return None;
+        }
+        let used = self
+            .section_size_by_stream
+            .get(&stream_id)
+            .copied()
+            .unwrap_or(0);
+        Some(self.max_field_section_size.saturating_sub(used))
     }
 
     /// Removes one decoded blocked section from the per-stream count.

@@ -85,7 +85,14 @@ impl Http3Options {
     /// Sets the maximum field-section size this endpoint will accept via
     /// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 Section 7.2.4.1).
     ///
-    /// Pass `None` for unlimited (the RFC default).
+    /// The size of a field section is the sum of its fields' name and value
+    /// lengths plus 32 bytes per field (RFC 9114 Section 4.2.2), and the
+    /// budget applies to a stream's field sections as a whole (request
+    /// headers and trailers).
+    ///
+    /// Pass `None` for unlimited (the RFC default). The number of fields a
+    /// section may carry is capped either way, so a section always costs a
+    /// bounded amount of memory.
     #[inline]
     pub fn max_field_section_size(mut self, max: Option<u64>) -> Self {
         self.local_settings.max_field_section_size = max;

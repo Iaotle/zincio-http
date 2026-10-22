@@ -939,7 +939,12 @@ fn build_request(headers: Vec<(Bytes, Bytes)>) -> Result<Request<()>, StreamErro
         .body(())
         .expect("validated parts build a request");
     for (name, value) in regular {
-        request.headers_mut().append(name, value);
+        // `try_append` reports the header map's capacity instead of
+        // panicking: a field section can carry more distinct names than the
+        // map holds, and the size budget alone does not rule that out.
+        if request.headers_mut().try_append(name, value).is_err() {
+            return Err(StreamError::Message);
+        }
     }
     Ok(request)
 }
@@ -1000,15 +1005,19 @@ fn build_uri(
 /// invalid in a trailer section (RFC 9114 Section 4.1).
 #[inline]
 fn header_map(headers: Vec<(Bytes, Bytes)>) -> Result<HeaderMap, StreamError> {
-    let mut map = HeaderMap::with_capacity(headers.len());
+    // `try_with_capacity` reports the map's capacity instead of panicking
+    // on a section with more fields than the map can ever hold.
+    let mut map = HeaderMap::try_with_capacity(headers.len()).unwrap_or_default();
     for (name, value) in headers {
         if name.first() == Some(&b':') {
             return Err(StreamError::Message);
         }
-        map.append(
-            HeaderName::from_bytes(&name).map_err(|_| StreamError::Message)?,
-            HeaderValue::from_maybe_shared(value).map_err(|_| StreamError::Message)?,
-        );
+        let name = HeaderName::from_bytes(&name).map_err(|_| StreamError::Message)?;
+        let value = HeaderValue::from_maybe_shared(value).map_err(|_| StreamError::Message)?;
+        // `try_append` reports the map's capacity instead of panicking.
+        if map.try_append(name, value).is_err() {
+            return Err(StreamError::Message);
+        }
     }
     Ok(map)
 }

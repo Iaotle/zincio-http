@@ -131,15 +131,24 @@ pub(crate) struct H3Body {
     stream: SharedRequest,
     data_done: bool,
     send_continue_body: Option<Arc<AtomicBool>>,
+    /// The connection's reset accounting, so a failure that only surfaces
+    /// while the body is read (a trailer field section that fails to
+    /// decode) can still close the connection.
+    conn_state: Arc<parking_lot::Mutex<ConnResetState>>,
 }
 
 impl H3Body {
     #[inline]
-    fn new(stream: SharedRequest, send_continue_body: Option<Arc<AtomicBool>>) -> Self {
+    fn new(
+        stream: SharedRequest,
+        send_continue_body: Option<Arc<AtomicBool>>,
+        conn_state: Arc<parking_lot::Mutex<ConnResetState>>,
+    ) -> Self {
         Self {
             stream,
             data_done: false,
             send_continue_body,
+            conn_state,
         }
     }
 }
@@ -175,6 +184,7 @@ impl Body for H3Body {
                         break;
                     }
                     Poll::Ready(Err(err)) => {
+                        report_connection_error(&this.conn_state, &err);
                         return Poll::Ready(Some(Err(h3_stream_error_to_io(err))));
                     }
                     Poll::Pending => {
@@ -199,7 +209,10 @@ impl Body for H3Body {
         match stream.poll_recv_trailers(cx) {
             Poll::Ready(Ok(Some(trailers))) => Poll::Ready(Some(Ok(BodyFrame::trailers(trailers)))),
             Poll::Ready(Ok(None)) => Poll::Ready(None),
-            Poll::Ready(Err(err)) => Poll::Ready(Some(Err(h3_stream_error_to_io(err)))),
+            Poll::Ready(Err(err)) => {
+                report_connection_error(&this.conn_state, &err);
+                Poll::Ready(Some(Err(h3_stream_error_to_io(err))))
+            }
             Poll::Pending => {
                 if let Some(scb) = this.send_continue_body.as_ref() {
                     scb.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -223,6 +236,24 @@ fn h3_transport_error_to_io(error: TransportError) -> std::io::Error {
 #[inline]
 fn h3_stream_error_to_io(error: stream::StreamError) -> std::io::Error {
     std::io::Error::other(error)
+}
+
+/// Records a connection-scoped failure that surfaced while the request body
+/// was read.
+///
+/// A trailer field section is decoded while the body is read, so a failure
+/// there (an over-budget field section, for instance) is only visible to the
+/// application as a body error. RFC 9204 Section 6 makes
+/// `QPACK_DECOMPRESSION_FAILED` a connection error, so the connection has to
+/// be closed with it even when the application ignores the body error.
+#[inline]
+fn report_connection_error(
+    conn_state: &Arc<parking_lot::Mutex<ConnResetState>>,
+    error: &stream::StreamError,
+) {
+    if let stream::StreamError::Qpack(err) = error {
+        conn_state.lock().close_code = Some(err.code() as u64);
+    }
 }
 
 /// Human-readable name for an HTTP/3 application error code, if known.
@@ -449,6 +480,7 @@ async fn handle_request<F, Fut, ResB, ResBE, ResE>(
             Incoming::Boxed(Box::pin(H3Body::new(
                 stream.clone(),
                 send_continue_body.clone(),
+                conn_state.clone(),
             ))),
             None,
         )

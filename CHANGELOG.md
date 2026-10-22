@@ -5,6 +5,7 @@
 **Not yet released**
 
 - Further improved response handling for HTTP `HEAD` requests (content length + HTTP/1.x transfer encoding)
+- Hardened the HTTP/3 implementation against potential QPACK deocding vulnerabilities
 
 ## `zincio-http` 0.4.13
 

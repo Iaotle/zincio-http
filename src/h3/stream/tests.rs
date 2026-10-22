@@ -858,3 +858,87 @@ fn connection_codes_map_per_rfc() {
         0x010e
     );
 }
+
+#[test]
+fn build_request_rejects_more_headers_than_the_header_map_holds() {
+    // `http::HeaderMap` holds at most 24 576 entries and panics when it
+    // is overfilled. A field section can carry more distinct names than
+    // that, so the request is rejected instead of panicking.
+    let mut headers = vec![
+        (Bytes::from_static(b":method"), Bytes::from_static(b"GET")),
+        (Bytes::from_static(b":scheme"), Bytes::from_static(b"https")),
+        (Bytes::from_static(b":path"), Bytes::from_static(b"/")),
+        (
+            Bytes::from_static(b":authority"),
+            Bytes::from_static(b"example.com"),
+        ),
+    ];
+    for i in 0..30_000 {
+        headers.push((Bytes::from(format!("x{i:05}")), Bytes::from_static(b"v")));
+    }
+    assert!(matches!(build_request(headers), Err(StreamError::Message)));
+}
+
+#[test]
+fn header_map_rejects_more_headers_than_the_header_map_holds() {
+    // The trailer field section goes through the same container; a
+    // section with more fields than the map can hold is a message error,
+    // not a panic.
+    let headers: Vec<(Bytes, Bytes)> = (0..30_000)
+        .map(|i| (Bytes::from(format!("x{i:05}")), Bytes::from_static(b"v")))
+        .collect();
+    assert!(matches!(header_map(headers), Err(StreamError::Message)));
+}
+
+#[test]
+fn header_map_accepts_repeated_names() {
+    // Repeated names are stored as extra values, which the map does not
+    // count against its entry capacity.
+    let headers: Vec<(Bytes, Bytes)> = (0..30_000)
+        .map(|_| (Bytes::from_static(b"x-repeat"), Bytes::from_static(b"v")))
+        .collect();
+    let map = header_map(headers).expect("repeated names fit");
+    assert_eq!(map.len(), 30_000);
+    assert_eq!(map.keys().count(), 1);
+}
+
+#[test]
+fn oversized_trailer_section_is_rejected() {
+    // A trailer field section that exceeds the field-section budget is a
+    // QPACK decompression failure, not a message that reaches the header
+    // map: the decoder rejects it while it is decoded.
+    let (shared, mut enc) = shared_and_peer_encoder();
+    let mut wire = BytesMut::new();
+    let section = enc.encode_section(0, &request_lines("PUT", "/x"));
+    shared
+        .decoder
+        .lock()
+        .feed_encoder_stream(&section.encoder_stream)
+        .expect("valid");
+    Frame::Headers(section.block).encode(&mut wire);
+
+    // A trailer section with more fields than the budget allows.
+    let mut trailer_lines = Vec::new();
+    for i in 0..4_000 {
+        trailer_lines.push((Bytes::from(format!("x{i:05}")), Bytes::from_static(b"v")));
+    }
+    let section = enc.encode_section(0, &trailer_lines);
+    shared
+        .decoder
+        .lock()
+        .feed_encoder_stream(&section.encoder_stream)
+        .expect("valid");
+    Frame::Headers(section.block).encode(&mut wire);
+
+    let mut stream = MockBidi::new(22);
+    stream.feed(&wire);
+    stream.finish();
+    let mut request = RequestStream::new(Box::new(stream), shared);
+
+    let mut cx = cx();
+    assert!(request.poll_headers(&mut cx).is_ready());
+    assert_eq!(
+        request.poll_recv_data(&mut cx),
+        Poll::Ready(Err(StreamError::Qpack(QpackError::DecompressionFailed)))
+    );
+}

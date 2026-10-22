@@ -328,11 +328,12 @@ fn empty_section() {
 fn field_section_size_capped() {
     // A field section whose decoded size alone exceeds the advertised
     // SETTINGS_MAX_FIELD_SECTION_SIZE is a decompression failure (RFC
-    // 9204 Section 4.5). The cap counts decoded names and values, not
-    // the encoded block.
+    // 9204 Section 4.5). The cap counts the decoded names and values plus
+    // the 32-byte per-field overhead of RFC 9114 Section 4.2.2, not the
+    // encoded block.
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(10);
-    // Name "x" (1) + value of 10 octets: 11, one over the cap.
+    // Name "x" (1) + value of 9 octets + 32 overhead: exactly the cap.
+    dec.set_max_field_section_size(42);
     assert_eq!(
         dec.decode_block(b"\x00\x00\x21x\x0ayyyyyyyyyy", 0, 0),
         Err(QpackError::DecompressionFailed)
@@ -340,11 +341,97 @@ fn field_section_size_capped() {
     // A section of exactly the cap decodes.
     let headers = dec.decode_block(b"\x00\x00\x21x\tyyyyyyyyy", 1, 0).unwrap();
     assert_eq!(headers.as_deref(), Some(&[hdr("x", "yyyyyyyyy")][..]));
-    // Static table lines count too: content-length: 0 is 15 octets.
+    // Static table lines count too: content-length: 0 is 15 octets, plus
+    // the 32-byte overhead.
     assert_eq!(
         dec.decode_block(b"\x00\x00\xc4", 2, 0),
         Err(QpackError::DecompressionFailed)
     );
+}
+
+#[test]
+fn field_section_size_charges_the_per_field_overhead() {
+    // RFC 9114 Section 4.2.2: a field list's size is the sum of its
+    // fields' name and value lengths "plus an overhead of 32 bytes for
+    // each field". Without the overhead, a section of many tiny fields
+    // would stay "within" the limit no matter how many it carried.
+    let mut dec = Decoder::new(220, 8);
+    // Three one-byte-name, empty-value fields: 3 name octets, but
+    // 3 * (1 + 0 + 32) = 99 octets of field list.
+    dec.set_max_field_section_size(98);
+    let mut block = vec![0x00, 0x00];
+    for _ in 0..3 {
+        block.extend_from_slice(b"\x21a\x00");
+    }
+    assert_eq!(
+        dec.decode_block(&block, 0, 0),
+        Err(QpackError::DecompressionFailed)
+    );
+    // Two of them fit: 2 * 33 = 66.
+    let mut dec = Decoder::new(220, 8);
+    dec.set_max_field_section_size(66);
+    let mut block = vec![0x00, 0x00];
+    for _ in 0..2 {
+        block.extend_from_slice(b"\x21a\x00");
+    }
+    let headers = dec.decode_block(&block, 1, 0).unwrap();
+    assert_eq!(headers.as_deref(), Some(&[hdr("a", ""), hdr("a", "")][..]));
+}
+
+#[test]
+fn zero_length_fields_still_charge_the_budget() {
+    // A field line with an empty name and an empty value carries no octets
+    // of its own; the per-field overhead is what keeps a section of them
+    // from bypassing the limit entirely.
+    let mut dec = Decoder::new(220, 8);
+    dec.set_max_field_section_size(96);
+    let mut block = vec![0x00, 0x00];
+    for _ in 0..4 {
+        // Literal field line with literal name, name length 0, value
+        // length 0.
+        block.extend_from_slice(b"\x20\x00");
+    }
+    // 4 * 32 = 128 octets of field list: over the cap.
+    assert_eq!(
+        dec.decode_block(&block, 0, 0),
+        Err(QpackError::DecompressionFailed)
+    );
+    // Three of them fit: 3 * 32 = 96.
+    let mut dec = Decoder::new(220, 8);
+    dec.set_max_field_section_size(96);
+    let mut block = vec![0x00, 0x00];
+    for _ in 0..3 {
+        block.extend_from_slice(b"\x20\x00");
+    }
+    assert!(dec.decode_block(&block, 1, 0).unwrap().is_some());
+}
+
+#[test]
+fn field_count_is_capped_even_without_a_size_limit() {
+    // The number of fields a section may carry is bounded independently of
+    // the field-section size limit: with the limit disabled, a section of
+    // empty fields would otherwise cost nothing and hold everything.
+    let mut dec = Decoder::new(220, 8);
+    dec.set_max_field_section_size(usize::MAX);
+    let mut block = vec![0x00, 0x00];
+    for _ in 0..=MAX_FIELDS_PER_SECTION {
+        // Literal field line with literal name, name length 0, value
+        // length 0.
+        block.extend_from_slice(b"\x20\x00");
+    }
+    assert_eq!(
+        dec.decode_block(&block, 0, 0),
+        Err(QpackError::DecompressionFailed)
+    );
+    // One field fewer is accepted.
+    let mut dec = Decoder::new(220, 8);
+    dec.set_max_field_section_size(usize::MAX);
+    let mut block = vec![0x00, 0x00];
+    for _ in 0..MAX_FIELDS_PER_SECTION {
+        block.extend_from_slice(b"\x20\x00");
+    }
+    let headers = dec.decode_block(&block, 1, 0).unwrap().expect("decodes");
+    assert_eq!(headers.len(), MAX_FIELDS_PER_SECTION);
 }
 
 #[test]
@@ -354,8 +441,8 @@ fn field_section_size_budget_is_per_stream() {
     // SETTINGS_MAX_HEADER_LIST_SIZE does for HTTP/2, rather than
     // capping each section on its own.
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(20);
-    // :method GET (10) + :authority (10): exactly the budget.
+    // :method GET (10 + 32) + :authority (10 + 32): exactly the budget.
+    dec.set_max_field_section_size(84);
     let headers = dec.decode_block(b"\x00\x01\xd1\xc0", 3, 0).unwrap();
     assert_eq!(
         headers.as_deref(),
@@ -375,8 +462,8 @@ fn field_section_size_budget_is_per_stream() {
 #[test]
 fn stream_finished_releases_budget() {
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(10);
-    // :method GET (10): exactly the budget.
+    // :method GET (10 + 32): exactly the budget.
+    dec.set_max_field_section_size(42);
     assert!(dec.decode_block(b"\x00\x01\xd1", 2, 0).unwrap().is_some());
     assert_eq!(
         dec.decode_block(b"\x00\x00\x21a\x01b", 2, 0),
@@ -394,7 +481,7 @@ fn stream_finished_releases_budget() {
 #[test]
 fn stream_cancelled_releases_budget() {
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(10);
+    dec.set_max_field_section_size(42);
     assert!(dec.decode_block(b"\x00\x01\xd1", 4, 0).unwrap().is_some());
     assert_eq!(hex(&dec.stream_cancelled(4)), "44");
     // The reset stream's budget is gone; sections fit again.
@@ -418,9 +505,9 @@ fn blocked_section_size_capped_on_unblock() {
         .block;
 
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(10);
-    // custom-key (10) + custom-value (12) = 22, but the section is
-    // buffered before its decoded size is known.
+    // custom-key (10) + custom-value (12) + 32 overhead = 54.
+    dec.set_max_field_section_size(53);
+    // The section is buffered before its decoded size is known.
     assert!(dec.decode_block(&block, 7, 0).unwrap().is_none());
     assert_eq!(
         dec.feed_encoder_stream(&es),
@@ -441,19 +528,20 @@ fn blocked_section_charges_the_stream_budget() {
         .block;
 
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(30);
-    // :method GET (10) on the stream, then a blocked 22-octet section.
+    // :method GET (42) on the stream, then a blocked 54-octet section:
+    // 96 octets of field list in total.
+    dec.set_max_field_section_size(95);
     assert!(dec.decode_block(b"\x00\x01\xd1", 7, 0).unwrap().is_some());
     assert!(dec.decode_block(&block, 7, 0).unwrap().is_none());
-    // 10 + 22 > 30: the stream is over its budget once unblocked.
+    // 42 + 54 > 95: the stream is over its budget once unblocked.
     assert_eq!(
         dec.feed_encoder_stream(&es),
         Err(QpackError::DecompressionFailed)
     );
 
-    // The same 22-octet section alone fits on a fresh stream.
+    // The same 54-octet section alone fits on a fresh stream.
     let mut dec = Decoder::new(220, 8);
-    dec.set_max_field_section_size(30);
+    dec.set_max_field_section_size(95);
     assert!(dec.decode_block(&block, 9, 0).unwrap().is_none());
     let sections = dec.feed_encoder_stream(&es).unwrap();
     assert_eq!(sections.len(), 1);
