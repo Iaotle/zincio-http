@@ -931,6 +931,8 @@ where
                 if let Some(sleep) = shutdown_sleep.as_mut() {
                     if let Poll::Ready(()) = Pin::new(&mut *sleep).poll(cx) {
                         sleep.reset(Instant::now() + std::time::Duration::from_millis(10));
+                        // Re-register the wake-up for the new deadline.
+                        let _ = Pin::new(&mut *sleep).poll(cx);
                     }
                 }
 
@@ -1037,20 +1039,23 @@ where
                         // Give the send scheduler a grace window to flush
                         // the last response before we close. See the comment
                         // on `drain_grace` above.
-                        if let Some(grace) = drain_grace.as_mut() {
-                            if Pin::new(&mut *grace).poll(cx).is_ready() {
-                                ready!(conn
-                                    .poll_shutdown(cx, H3_NO_ERROR)
-                                    .map_err(h3_transport_error_to_io))?;
-                                return Poll::Ready(outcome.take().unwrap_or(Ok(())));
-                            }
-                        } else {
-                            drain_grace =
-                                Some(zincio::time::sleep(std::time::Duration::from_millis(50)));
+                        // Polled as soon as it is armed, so its wake-up is
+                        // registered before this poll returns `Pending`.
+                        let grace = drain_grace.get_or_insert_with(|| {
+                            zincio::time::sleep(std::time::Duration::from_millis(50))
+                        });
+                        if Pin::new(&mut *grace).poll(cx).is_ready() {
+                            ready!(conn
+                                .poll_shutdown(cx, H3_NO_ERROR)
+                                .map_err(h3_transport_error_to_io))?;
+                            return Poll::Ready(outcome.take().unwrap_or(Ok(())));
                         }
                     } else if shutdown_sleep.is_none() {
-                        shutdown_sleep =
-                            Some(zincio::time::sleep(std::time::Duration::from_millis(10)));
+                        let mut backstop =
+                            zincio::time::sleep(std::time::Duration::from_millis(10));
+                        // Registers the wake-up; the top of the loop re-arms it.
+                        let _ = Pin::new(&mut backstop).poll(cx);
+                        shutdown_sleep = Some(backstop);
                     }
                 }
 
@@ -1130,7 +1135,12 @@ where
                     Poll::Ready(None) => {}
                     Poll::Pending => {}
                 }
-                if ongoing.is_empty() && shutdown {
+                // Shutting down with nothing in flight: go round once more so
+                // the block above arms the drain-grace timer, then park on it.
+                // Looping until the timer fires instead busy-waits for the
+                // whole grace window (a timer that only completes when the
+                // runtime drives it never fires at all).
+                if ongoing.is_empty() && shutdown && drain_grace.is_none() {
                     continue;
                 }
 
