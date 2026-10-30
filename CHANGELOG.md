@@ -1,5 +1,11 @@
 # `zincio-http` change log
 
+## `zincio-http` UNRELEASED
+
+**Not yet released**
+
+- Fixed busy-looping while gracefully shutting down an HTTP/3 connection ([thank you, @Iaotle](https://github.com/ferronweb/zincio-http/pull/39))
+
 ## `zincio-http` 0.4.14
 
 **Released in October 22, 2026**
