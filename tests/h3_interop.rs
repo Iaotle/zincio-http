@@ -808,6 +808,76 @@ async fn h3_client_idle_connection_closes_after_accept_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h3_accept_timeout_ignores_in_flight_requests() {
+    // The accept timeout bounds an idle connection's wait for its next request.
+    // A request that takes longer than the timeout must not start the graceful
+    // shutdown: the next request on the same connection is still served.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (_server_ep, _client_ep, client_conn, server_conn) = loopback_pair().await;
+        let cancel = CancellationToken::new();
+        let (server_thread, server_result) = spawn_native_server(
+            server_conn,
+            Http3Options::new().accept_timeout(Some(Duration::from_millis(300))),
+            cancel.clone(),
+            |request| async move {
+                if request.uri().path() == "/slow" {
+                    // Longer than the accept timeout. A thread does the waiting, so
+                    // the handler's future stays `Send`.
+                    let (done, wait) = tokio::sync::oneshot::channel();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let _ = done.send(());
+                    });
+                    let _ = wait.await;
+                }
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"done")))
+                        .expect("response"),
+                )
+            },
+        );
+
+        let (mut conn, mut send_request) = h3::client::builder()
+            .build(h3_quinn::Connection::new(client_conn))
+            .await
+            .expect("h3 client");
+        let drive = tokio::spawn(async move {
+            let _ = conn.wait_idle().await;
+            std::future::pending::<()>().await;
+        });
+
+        for path in ["/slow", "/after"] {
+            let request = Request::get(format!("https://localhost{path}"))
+                .body(())
+                .unwrap();
+            let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes> =
+                send_request.send_request(request).await.expect(path);
+            stream.finish().await.expect("finish");
+            let response = stream.recv_response().await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.recv_data().await.expect("data") {
+                body.extend_from_slice(chunk.chunk());
+            }
+            assert_eq!(body, b"done", "{path}");
+        }
+
+        cancel.cancel();
+        drive.abort();
+        drop(send_request);
+        let result = server_result
+            .recv_timeout(Duration::from_secs(10))
+            .expect("server finished");
+        assert!(result.is_ok(), "server handle: {result:?}");
+        server_thread.join().expect("join server");
+    })
+    .await
+    .expect("h3_accept_timeout_ignores_in_flight_requests timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fixture_client_wire_get() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let (_server_ep, _client_ep, client_conn, server_conn) = loopback_pair().await;
