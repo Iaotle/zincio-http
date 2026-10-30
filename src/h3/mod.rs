@@ -912,10 +912,14 @@ where
                     }
                 }
 
-                // Accept-timeout window: refreshed whenever a request
-                // stream is accepted; it bounds waiting for the next one.
+                // Accept-timeout window: it bounds how long an idle
+                // connection waits for its next request, so it only runs
+                // while no request is in flight; a request (or response)
+                // that outlasts it must not start the graceful shutdown.
                 let mut timeout_fired = false;
-                if let Some(sleep) = accept_sleep.as_mut() {
+                if !ongoing.is_empty() {
+                    accept_sleep = None;
+                } else if let Some(sleep) = accept_sleep.as_mut() {
                     if let Poll::Ready(()) = Pin::new(&mut *sleep).poll(cx) {
                         accept_sleep = None;
                         timeout_fired = true;
