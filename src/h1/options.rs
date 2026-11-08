@@ -49,8 +49,8 @@ impl Http1Options {
     /// Sets the maximum number of bytes that may be read while parsing the
     /// request head (status line + headers).
     ///
-    /// Requests whose head exceeds this limit are rejected with an
-    /// `InvalidData` I/O error. Defaults to **16 384** bytes.
+    /// Requests whose head exceeds this limit are answered with `431 Request
+    /// Header Fields Too Large` and end with an `InvalidData` I/O error. Defaults to **16 384** bytes.
     pub fn max_header_size(mut self, size: usize) -> Self {
         self.max_header_size = size;
         self
@@ -58,8 +58,8 @@ impl Http1Options {
 
     /// Sets the maximum number of headers that will be parsed per request.
     ///
-    /// Headers beyond this count are silently ignored by the underlying
-    /// `httparse` parser. Defaults to **128**.
+    /// Requests with more are answered with `431 Request Header Fields Too
+    /// Large`. Defaults to **128**.
     pub fn max_header_count(mut self, count: usize) -> Self {
         self.max_header_count = count;
         self
