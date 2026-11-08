@@ -518,7 +518,9 @@ where
         }
     }
     #[inline]
-    pub(crate) fn apply_peer_settings(&mut self, settings: &[crate::h2::codec::Setting]) {
+    /// Returns whether the streams' send windows grew.
+    pub(crate) fn apply_peer_settings(&mut self, settings: &[crate::h2::codec::Setting]) -> bool {
+        let mut raised = false;
         for setting in settings {
             match setting.id {
                 0x01 => {
@@ -540,6 +542,7 @@ where
                     if overflow {
                         self.goaway(Reason::FlowControlError, b"initial window overflow");
                     }
+                    raised |= delta > 0;
                 }
                 0x05 => {
                     // SETTINGS_MAX_FRAME_SIZE: bounds-checked, since the
@@ -549,7 +552,7 @@ where
                         || setting.value > MAX_FRAME_SIZE_LIMIT as u32
                     {
                         self.goaway(Reason::ProtocolError, b"invalid SETTINGS_MAX_FRAME_SIZE");
-                        return;
+                        return false;
                     }
                     self.peer.max_frame_size = setting.value as usize;
                     self.writer.max_frame_size = setting.value as usize;
@@ -558,6 +561,7 @@ where
                 _ => {}
             }
         }
+        raised
     }
 
     /// Queues a GOAWAY frame; the connection closes after it flushes.
